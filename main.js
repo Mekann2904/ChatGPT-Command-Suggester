@@ -57,39 +57,101 @@
       color:var(--text-secondary,#6b6c7b);overflow:hidden;text-overflow:ellipsis;
       white-space:nowrap
     }
-    html.dark .cgpt-suggestion-item .desc{
-      color:var(--text-secondary,#a9a9b3)
-    }
+    html.dark .cgpt-suggestion-item .desc{color:var(--text-secondary,#a9a9b3)}
   `);
 
+  /* ===== DOMユーティリティ ==================================================== */
   const SUGGESTER_ID = 'cgpt-command-suggester';
-  let inputField = null;
+  let inputEl = null;               // textarea or contenteditable
+  let inputType = null;             // 'textarea' | 'contenteditable'
   let suggesterContainer = null;
   let activeSuggestionIndex = -1;
-  let debouncedShowSuggestions;
+  let debouncedShow;
 
-  /**
-   * 遅延実行（デバウンス）のためのユーティリティ関数
-   * @param {Function} func 実行する関数
-   * @param {number} delay 遅延させる時間(ms)
-   * @returns {Function}
-   */
-  function debounce(func, delay) {
-    let timeoutId;
-    return (...args) => {
-      clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => func.apply(this, args), delay);
-    };
+  const debounce = (fn, ms) => {
+    let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); };
+  };
+
+  const textareaValueSetter =
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+
+  function detectInputEl() {
+    // 最優先：textarea#prompt-textarea（複数行・安定）
+    const ta = document.querySelector('textarea#prompt-textarea');
+    if (ta) return { el: ta, type: 'textarea' };
+
+    // フォールバック：contenteditable な textbox
+    const ce = document.querySelector('div[contenteditable="true"][role="textbox"], div[contenteditable="true"]#prompt-textarea');
+    if (ce) return { el: ce, type: 'contenteditable' };
+
+    return { el: null, type: null };
   }
 
-  /** 入力欄(contenteditable div)を検出 */
-  function findInputField() {
-    return document.querySelector('div#prompt-textarea');
+  function getValue() {
+    if (!inputEl) return '';
+    if (inputType === 'textarea') return inputEl.value ?? '';
+    // contenteditable: 改行は \n として返す
+    return (inputEl.innerText || '').replace(/\u00A0/g, ' ');
   }
 
-  /** UIを生成して入力欄の親(form)に配置 */
+  function setValue(text) {
+    if (!inputEl) return;
+    if (inputType === 'textarea') {
+      // React 制御への正攻法
+      if (textareaValueSetter) textareaValueSetter.call(inputEl, text);
+      else inputEl.value = text;
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    } else {
+      // contenteditable は HTML に変換して挿入
+      const esc = s => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      inputEl.innerHTML = text.split('\n').map(esc).join('<br>');
+      inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: text }));
+    }
+  }
+
+  function focusToEnd() {
+    if (!inputEl) return;
+    inputEl.focus();
+    if (inputType === 'textarea') {
+      const len = (inputEl.value || '').length;
+      inputEl.setSelectionRange(len, len);
+    } else {
+      const range = document.createRange();
+      range.selectNodeContents(inputEl);
+      range.collapse(false);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  }
+
+  /* ===== 現在行＆トークン判定（: で始まるとき発火） ========================== */
+  function getCaretInfo() {
+    if (!inputEl) return { start: 0, end: 0 };
+    if (inputType === 'textarea') {
+      return { start: inputEl.selectionStart ?? 0, end: inputEl.selectionEnd ?? 0 };
+    } else {
+      // contenteditable の厳密な caret 取得は複雑。フォールバックで末尾扱い。
+      const t = getValue();
+      return { start: t.length, end: t.length };
+    }
+  }
+
+  function getCurrentLineToken() {
+    const text = getValue();
+    const { start } = getCaretInfo();
+    const before = text.slice(0, start);
+    const lineStart = before.lastIndexOf('\n') + 1;
+    const lineToCaret = before.slice(lineStart); // 現在行の先頭〜caret
+    // コマンドは ":" で始まり、空白を含まない想定で抽出（":code" など）
+    const match = lineToCaret.match(/:[^\s]*$/);
+    return match ? match[0] : '';
+  }
+
+  /* ===== UI生成 =============================================================== */
   function createUI() {
-    const form = inputField?.closest('form');
+    if (!inputEl) return;
+    const form = inputEl.closest('form') || inputEl.parentElement;
     if (!form || document.getElementById(SUGGESTER_ID)) return;
 
     form.style.position = 'relative';
@@ -97,99 +159,86 @@
     suggesterContainer.id = SUGGESTER_ID;
     suggesterContainer.style.display = 'none';
 
-    // クリックイベントは親要素で一括して処理（イベント委任）
+    // mousedown で確定（blurの前に動く）
     suggesterContainer.addEventListener('mousedown', e => {
       e.preventDefault();
-      const targetItem = e.target.closest('.cgpt-suggestion-item');
-      if (targetItem && targetItem.dataset.command) {
-        insert(targetItem.dataset.command);
+      const item = e.target.closest('.cgpt-suggestion-item');
+      if (item?.dataset.command) {
+        acceptCommand(item.dataset.command);
       }
     });
 
     form.appendChild(suggesterContainer);
   }
 
-  /** 候補リストを更新して表示 */
+  function updateHighlight() {
+    const items = suggesterContainer?.querySelectorAll('.cgpt-suggestion-item');
+    if (!items || !items.length) return;
+    items.forEach((el, i) => el.classList.toggle('selected', i === activeSuggestionIndex));
+    items[activeSuggestionIndex]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function hidePanel() {
+    if (suggesterContainer) suggesterContainer.style.display = 'none';
+    activeSuggestionIndex = -1;
+  }
+
   function showSuggestions() {
-    if (!inputField || !suggesterContainer) return;
+    if (!inputEl || !suggesterContainer) return;
 
-    const value = inputField.textContent || "";
-    // ★変更点: トリガーのチェックを `/` から `:` に変更
-    if (!value.startsWith(':')) {
-      hide();
-      return;
-    }
+    const token = getCurrentLineToken();
+    if (!token || token[0] !== ':') { hidePanel(); return; }
 
-    const filteredCommands = Object.keys(commands)
-      .filter(c => c.toLowerCase().startsWith(value.toLowerCase()));
+    const list = Object.keys(commands)
+      .filter(c => c.toLowerCase().startsWith(token.toLowerCase()));
 
-    if (filteredCommands.length === 0) {
-      hide();
-      return;
-    }
+    if (!list.length) { hidePanel(); return; }
 
-    // DocumentFragmentを使ってDOM要素を効率的に構築
-    const fragment = document.createDocumentFragment();
+    const frag = document.createDocumentFragment();
     activeSuggestionIndex = 0;
 
-    filteredCommands.forEach(cmd => {
+    list.forEach(cmd => {
       const item = document.createElement('div');
       item.className = 'cgpt-suggestion-item';
-      item.dataset.command = cmd; // コマンド名をdata属性に保持
-      item.innerHTML = `<span class="cmd">${cmd}</span><span class="desc">${commands[cmd].split('\n')[0]}</span>`;
-      fragment.appendChild(item);
+      item.dataset.command = cmd;
+      const firstLine = (commands[cmd] || '').split(/\r?\n/, 1)[0];
+      item.innerHTML = `<span class="cmd">${cmd}</span><span class="desc">${firstLine || ''}</span>`;
+      frag.appendChild(item);
     });
 
-    suggesterContainer.replaceChildren(fragment); // 一度の操作でDOMを更新
+    suggesterContainer.replaceChildren(frag);
     suggesterContainer.style.display = 'block';
     updateHighlight();
   }
 
-  /** 候補リストを隠す */
-  function hide() {
-    if (suggesterContainer) {
-      suggesterContainer.style.display = 'none';
-    }
-    activeSuggestionIndex = -1;
+  /* ===== 置換：現在行の :トークン をコマンド本文に差し替え =================== */
+  function acceptCommand(cmdKey) {
+    const body = commands[cmdKey];
+    if (!body || !inputEl) return;
+
+    const text = getValue();
+    const { start, end } = getCaretInfo();
+    const before = text.slice(0, start);
+    const after = text.slice(end);
+
+    const lineStart = before.lastIndexOf('\n') + 1;
+    const m = before.slice(lineStart).match(/:[^\s]*$/);
+    const tokenStart = m ? (lineStart + m.index) : start;
+
+    const newText = text.slice(0, tokenStart) + body + after;
+    setValue(newText);
+    hidePanel();
+    focusToEnd();
   }
 
-  /** コマンドを入力欄へ挿入 */
-  function insert(cmd) {
-    if (!commands[cmd] || !inputField) return;
-
-    inputField.textContent = commands[cmd];
-    hide();
-
-    // Reactに内容の変更を通知
-    inputField.dispatchEvent(new Event('input', { bubbles: true }));
-    inputField.focus();
-
-    // カーソルを末尾に移動
-    const range = document.createRange();
-    const sel = window.getSelection();
-    range.selectNodeContents(inputField);
-    range.collapse(false);
-    sel.removeAllRanges();
-    sel.addRange(range);
-  }
-
-  /** 選択ハイライト更新 */
-  function updateHighlight() {
-    const items = suggesterContainer?.querySelectorAll('.cgpt-suggestion-item');
-    if (!items || items.length === 0) return;
-
-    items.forEach((el, i) => {
-      el.classList.toggle('selected', i === activeSuggestionIndex);
-    });
-    items[activeSuggestionIndex]?.scrollIntoView({ block: 'nearest' });
-  }
-
-  /** キーボード操作 */
-  function handleKeyDown(e) {
-    if (suggesterContainer?.style.display !== 'block') return;
+  /* ===== キーボード操作 ======================================================= */
+  function onKeyDown(e) {
+    // サジェスト表示時のみナビゲーション／確定を奪う
+    const panelOpen = suggesterContainer?.style.display === 'block';
+    if (!panelOpen) return;
 
     const items = suggesterContainer.querySelectorAll('.cgpt-suggestion-item');
-    if (items.length === 0) return;
+    if (!items.length) return;
 
     switch (e.key) {
       case 'ArrowDown':
@@ -202,47 +251,54 @@
         activeSuggestionIndex = (activeSuggestionIndex - 1 + items.length) % items.length;
         updateHighlight();
         break;
-      case 'Enter':
       case 'Tab':
-        if (activeSuggestionIndex > -1) {
-          e.preventDefault();
-          const selectedItem = items[activeSuggestionIndex];
-          if (selectedItem?.dataset.command) {
-            insert(selectedItem.dataset.command);
-          }
-        }
+        e.preventDefault();
+        items[activeSuggestionIndex]?.dataset.command && acceptCommand(items[activeSuggestionIndex].dataset.command);
+        break;
+      case 'Enter':
+        // Shift+Enter は改行として素通し（複数行入力を壊さない）
+        if (e.shiftKey || e.altKey || e.metaKey || e.ctrlKey) return;
+        e.preventDefault();
+        items[activeSuggestionIndex]?.dataset.command && acceptCommand(items[activeSuggestionIndex].dataset.command);
         break;
       case 'Escape':
         e.preventDefault();
-        hide();
+        hidePanel();
         break;
     }
   }
 
-  /** 監視とイベントリスナーの設定 */
-  function initialize() {
-    const currentInputField = findInputField();
-    if (currentInputField === inputField) {
-      return; // 既に設定済みなら何もしない
+  /* ===== 初期化＆監視 ========================================================= */
+  function bind() {
+    const found = detectInputEl();
+    if (found.el === inputEl) return;
+
+    inputEl = found.el;
+    inputType = found.type;
+
+    if (!inputEl) return;
+
+    createUI();
+
+    if (debouncedShow) {
+      inputEl.removeEventListener('input', debouncedShow);
+      inputEl.removeEventListener('keydown', onKeyDown, true);
     }
 
-    if (currentInputField) {
-      inputField = currentInputField;
-      createUI(); // UIが存在しなければ作成
-
-      // デバウンスの遅延を75msに短縮
-      debouncedShowSuggestions = debounce(showSuggestions, 75);
-
-      inputField.addEventListener('input', debouncedShowSuggestions);
-      inputField.addEventListener('keydown', handleKeyDown, true);
-      // blurイベントはクリックを妨げないように少し遅延させる
-      inputField.addEventListener('blur', () => setTimeout(hide, 200));
-    }
+    debouncedShow = debounce(showSuggestions, 60);
+    inputEl.addEventListener('input', debouncedShow);
+    // capture=false（バブリング）にして他ショートカットとの干渉を最小化
+    inputEl.addEventListener('keydown', onKeyDown, false);
+    inputEl.addEventListener('blur', () => setTimeout(hidePanel, 180));
   }
 
-  // スクリプト実行時に一度、即時実行する
-  initialize();
+  // 初回実行
+  bind();
 
-  // ページ遷移後などのために、定期的なチェックも残す
-  setInterval(initialize, 500);
+  // DOM変化を監視して入力欄差し替えに追従（SPA遷移・再レンダリング対応）
+  const mo = new MutationObserver(debounce(bind, 120));
+  mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+
+  // 予備のポーリング（安全網）
+  setInterval(bind, 1000);
 })();
